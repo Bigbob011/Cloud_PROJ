@@ -519,62 +519,84 @@ def db_get_all_books() -> list[dict]:
 def books_api(req: func.HttpRequest) -> func.HttpResponse:
     """
     Handle:
-      - GET /api/books   -> list all books
-      - POST /api/books  -> create a new book
+      - GET  /api/books   → return all books
+      - POST /api/books   → create a new book
 
-    Uses Azure SQL when USE_SQL is true, otherwise falls back to in-memory list.
+    Behavior:
+      • When USE_SQL is True  → read/write from Azure SQL (Books table).
+      • When USE_SQL is False → use in-memory list (local dev / fallback).
+
+    Auth:
+      • Requires a valid x-api-key header (value loaded from Key Vault or config).
     """
-    logging.info("📘 BooksAPI invoked: %s", req.method)
+    logging.info("📘 [BooksAPI] HTTP %s", req.method)
 
-    # --- Authentication ---
+    # -------- Authentication --------
     if not check_api_key(req):
-        return error_response("Unauthorized", 401)
+        logging.warning("🔐 [BooksAPI] Unauthorized request.")
+        return error_response("Unauthorized", status=401)
 
-    # ---------- POST: create ----------
+    # ================================
+    # POST /api/books → Create a new book
+    # ================================
     if req.method == "POST":
         if not require_json_content(req):
-            return error_response("Content-Type must be application/json", 400)
+            logging.warning("⚠️ [BooksAPI] Missing or invalid Content-Type.")
+            return error_response("Content-Type must be application/json", status=400)
+
         try:
             body = req.get_json()
         except ValueError:
-            return error_response("Invalid JSON body", 400)
+            logging.warning("⚠️ [BooksAPI] Invalid JSON body.")
+            return error_response("Invalid JSON body", status=400)
 
         valid, err = validate_book_schema(body, require_all=True)
         if not valid:
-            return error_response(err, 400)
+            logging.warning("⚠️ [BooksAPI] Validation failed: %s", err)
+            return error_response(err, status=400)
 
-        # SQL path
+        # --- SQL-backed create ---
         if USE_SQL:
             try:
                 new_book = sql_insert_book(body)
-                return json_response(new_book, 201)
+                logging.info("✅ [BooksAPI] Created book in SQL with id=%s", new_book.get("id"))
+                return json_response(new_book, status=201)
             except Exception as ex:
-                logging.exception("Error inserting book into SQL")
-                return error_response(f"Database error: {ex}", 500)
+                logging.exception("💥 [BooksAPI] Error inserting book into SQL.")
+                return error_response(f"Database error: {ex}", status=500)
 
-        # In-memory fallback (local dev without SQL)
+        # --- In-memory fallback ---
         book = dict(body)
         book["id"] = str(uuid.uuid4())
         with books_lock:
             books.append(book)
-        return json_response(book, 201)
+        logging.info("✅ [BooksAPI] Created book in memory id=%s", book["id"])
+        return json_response(book, status=201)
 
-    # ---------- GET: list all ----------
+    # ================================
+    # GET /api/books → List all books
+    # ================================
     if req.method == "GET":
+        # --- SQL-backed read ---
         if USE_SQL:
             try:
                 all_books = sql_get_all_books()
-                return json_response(all_books, 200)
+                logging.info("📚 [BooksAPI] Returned %d book(s) from SQL.", len(all_books))
+                return json_response(all_books, status=200)
             except Exception as ex:
-                logging.exception("Error querying books from SQL")
-                return error_response(f"Database error: {ex}", 500)
+                logging.exception("💥 [BooksAPI] Error querying books from SQL.")
+                return error_response(f"Database error: {ex}", status=500)
 
-        # In-memory fallback
+        # --- In-memory fallback ---
         with books_lock:
             copy = list(books)
-        return json_response(copy, 200)
+        logging.info("📚 [BooksAPI] Returned %d book(s) from memory.", len(copy))
+        return json_response(copy, status=200)
 
-    return error_response("Method not allowed", 405)
+    # Method not allowed
+    logging.warning("⚠️ [BooksAPI] Method not allowed: %s", req.method)
+    return error_response("Method not allowed", status=405)
+
 
 # =========================================================
 #  4. Utility Endpoints (/books/count, /books/purge)
@@ -583,41 +605,73 @@ def books_api(req: func.HttpRequest) -> func.HttpResponse:
 @app.function_name(name="BooksCountAPI")
 @app.route(route="books/count", methods=["GET"])
 def books_count_api(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    GET /api/books/count
+
+    Returns:
+      { "count": <number of books> }
+
+    Uses SQL when available; otherwise uses the in-memory store.
+    """
+    logging.info("📊 [BooksCountAPI] HTTP GET /books/count")
+
     if not check_api_key(req):
-        return error_response("Unauthorized", 401)
+        logging.warning("🔐 [BooksCountAPI] Unauthorized request.")
+        return error_response("Unauthorized", status=401)
 
     if USE_SQL:
         try:
             n = sql_get_book_count()
+            logging.info("📊 [BooksCountAPI] SQL count=%d", n)
+            return json_response({"count": n}, status=200)
         except Exception as ex:
-            logging.exception("Error counting books in SQL")
-            return error_response(f"Database error: {ex}", 500)
-        return json_response({"count": n}, 200)
+            logging.exception("💥 [BooksCountAPI] Error counting books in SQL.")
+            return error_response(f"Database error: {ex}", status=500)
 
+    # In-memory fallback
     with books_lock:
         n = len(books)
-    return json_response({"count": n}, 200)
-
+    logging.info("📊 [BooksCountAPI] Memory count=%d", n)
+    return json_response({"count": n}, status=200)
 
 
 @app.function_name(name="BooksPurgeAPI")
 @app.route(route="books/purge", methods=["POST"])
 def books_purge_api(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    POST /api/books/purge
+
+    Deletes ALL book records.
+
+    SQL mode:
+      • Issues a DELETE against the Books table.
+
+    In-memory mode:
+      • Clears the books list.
+
+    Always returns a JSON message describing how many records were removed.
+    """
+    logging.info("🧹 [BooksPurgeAPI] HTTP POST /books/purge")
+
     if not check_api_key(req):
-        return error_response("Unauthorized", 401)
+        logging.warning("🔐 [BooksPurgeAPI] Unauthorized request.")
+        return error_response("Unauthorized", status=401)
 
     if USE_SQL:
         try:
             deleted = sql_purge_books()
+            logging.info("🧹 [BooksPurgeAPI] Purged %d book(s) from SQL.", deleted)
+            return json_response({"message": f"All books removed (deleted {deleted})"}, status=200)
         except Exception as ex:
-            logging.exception("Error purging books in SQL")
-            return error_response(f"Database error: {ex}", 500)
-        return json_response({"message": f"All books removed (deleted {deleted})"}, 200)
+            logging.exception("💥 [BooksPurgeAPI] Error purging books in SQL.")
+            return error_response(f"Database error: {ex}", status=500)
 
+    # In-memory fallback
     with books_lock:
+        deleted = len(books)
         books.clear()
-    return json_response({"message": "All books removed"}, 200)
-
+    logging.info("🧹 [BooksPurgeAPI] Purged %d book(s) from memory.", deleted)
+    return json_response({"message": f"All books removed (deleted {deleted})"}, status=200)
 
 
 # =========================================================
@@ -628,98 +682,135 @@ def books_purge_api(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="books/{book_id}", methods=["GET", "PUT", "DELETE"])
 def books_by_id_api(req: func.HttpRequest) -> func.HttpResponse:
     """
-    Handle GET, PUT, DELETE for a specific book.
-    Book is identified by its unique UUID in the route.
+    Handle operations on a single book:
+
+      • GET    /api/books/{book_id}  → fetch a single book
+      • PUT    /api/books/{book_id}  → update (partial) an existing book
+      • DELETE /api/books/{book_id}  → delete a book
+
+    Book identity:
+      • book_id is a UUID (string) generated when the book is created.
     """
-    logging.info("📗 BooksByIdAPI invoked: %s", req.method)
+    logging.info("📗 [BooksByIdAPI] HTTP %s /books/{book_id}", req.method)
 
     if not check_api_key(req):
-        return error_response("Unauthorized", 401)
+        logging.warning("🔐 [BooksByIdAPI] Unauthorized request.")
+        return error_response("Unauthorized", status=401)
 
     book_id = req.route_params.get("book_id")
     if not book_id:
-        return error_response("Missing book_id in route", 400)
+        logging.warning("⚠️ [BooksByIdAPI] Missing book_id route parameter.")
+        return error_response("Missing book_id in route", status=400)
 
-    # ---------- GET by ID ----------
+    # ================================
+    # GET /api/books/{book_id}
+    # ================================
     if req.method == "GET":
         if USE_SQL:
             try:
                 book = sql_get_book_by_id(book_id)
             except Exception as ex:
-                logging.exception("Error reading book from SQL")
-                return error_response(f"Database error: {ex}", 500)
+                logging.exception("💥 [BooksByIdAPI] Error reading book from SQL.")
+                return error_response(f"Database error: {ex}", status=500)
 
             if not book:
-                return error_response("Book not found", 404)
-            return json_response(book, 200)
+                logging.info("📗 [BooksByIdAPI] Book not found in SQL: %s", book_id)
+                return error_response("Book not found", status=404)
+
+            logging.info("📗 [BooksByIdAPI] Returned book id=%s from SQL.", book_id)
+            return json_response(book, status=200)
 
         # In-memory fallback
         with books_lock:
             for b in books:
                 if b.get("id") == book_id:
-                    return json_response(b, 200)
-        return error_response("Book not found", 404)
+                    logging.info("📗 [BooksByIdAPI] Returned book id=%s from memory.", book_id)
+                    return json_response(b, status=200)
 
-    # ---------- PUT (partial update) ----------
+        logging.info("📗 [BooksByIdAPI] Book not found in memory: %s", book_id)
+        return error_response("Book not found", status=404)
+
+    # ================================
+    # PUT /api/books/{book_id}
+    # ================================
     if req.method == "PUT":
         if not require_json_content(req):
-            return error_response("Content-Type must be application/json", 400)
+            logging.warning("⚠️ [BooksByIdAPI] Missing or invalid Content-Type.")
+            return error_response("Content-Type must be application/json", status=400)
+
         try:
             body = req.get_json()
         except ValueError:
-            return error_response("Invalid JSON body", 400)
+            logging.warning("⚠️ [BooksByIdAPI] Invalid JSON body.")
+            return error_response("Invalid JSON body", status=400)
 
         valid, err = validate_book_schema(body, require_all=False)
         if not valid:
-            return error_response(err, 400)
+            logging.warning("⚠️ [BooksByIdAPI] Validation failed: %s", err)
+            return error_response(err, status=400)
+
+        # Prevent ID tampering
+        if "id" in body and body["id"] != book_id:
+            logging.warning("⚠️ [BooksByIdAPI] Attempt to change book id from %s to %s", book_id, body["id"])
+            return error_response("Cannot change book id", status=400)
 
         if USE_SQL:
             try:
                 updated = sql_update_book(book_id, body)
             except Exception as ex:
-                logging.exception("Error updating book in SQL")
-                return error_response(f"Database error: {ex}", 500)
+                logging.exception("💥 [BooksByIdAPI] Error updating book in SQL.")
+                return error_response(f"Database error: {ex}", status=500)
 
             if not updated:
-                return error_response("Book not found", 404)
-            return json_response(updated, 200)
+                logging.info("📗 [BooksByIdAPI] Book not found for update in SQL: %s", book_id)
+                return error_response("Book not found", status=404)
+
+            logging.info("📗 [BooksByIdAPI] Updated book id=%s in SQL.", book_id)
+            return json_response(updated, status=200)
 
         # In-memory fallback
         with books_lock:
             idx = find_book_index(book_id)
             if idx == -1:
-                return error_response("Book not found", 404)
-
-            # Prevent ID changes
-            if "id" in body and body["id"] != book_id:
-                return error_response("Cannot change book id", 400)
+                logging.info("📗 [BooksByIdAPI] Book not found for update in memory: %s", book_id)
+                return error_response("Book not found", status=404)
 
             books[idx].update(body)
             updated = books[idx].copy()
-        return json_response(updated, 200)
+        logging.info("📗 [BooksByIdAPI] Updated book id=%s in memory.", book_id)
+        return json_response(updated, status=200)
 
-    # ---------- DELETE ----------
+    # ================================
+    # DELETE /api/books/{book_id}
+    # ================================
     if req.method == "DELETE":
         if USE_SQL:
             try:
                 affected = sql_delete_book(book_id)
             except Exception as ex:
-                logging.exception("Error deleting book in SQL")
-                return error_response(f"Database error: {ex}", 500)
+                logging.exception("💥 [BooksByIdAPI] Error deleting book in SQL.")
+                return error_response(f"Database error: {ex}", status=500)
 
             if affected == 0:
-                return error_response("Book not found", 404)
-            return json_response({"message": "Deleted successfully"}, 200)
+                logging.info("📗 [BooksByIdAPI] Book not found for delete in SQL: %s", book_id)
+                return error_response("Book not found", status=404)
+
+            logging.info("📗 [BooksByIdAPI] Deleted book id=%s from SQL.", book_id)
+            return json_response({"message": "Deleted successfully"}, status=200)
 
         # In-memory fallback
         with books_lock:
             idx = find_book_index(book_id)
             if idx == -1:
-                return error_response("Book not found", 404)
+                logging.info("📗 [BooksByIdAPI] Book not found for delete in memory: %s", book_id)
+                return error_response("Book not found", status=404)
             books.pop(idx)
-        return json_response({"message": "Deleted successfully"}, 200)
+        logging.info("📗 [BooksByIdAPI] Deleted book id=%s from memory.", book_id)
+        return json_response({"message": "Deleted successfully"}, status=200)
 
-    return error_response("Method not allowed", 405)
+    # Method not allowed
+    logging.warning("⚠️ [BooksByIdAPI] Method not allowed: %s", req.method)
+    return error_response("Method not allowed", status=405)
 
 # =========================================================
 #  6. Validation Endpoint (/books/validate)
