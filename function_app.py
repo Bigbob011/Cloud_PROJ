@@ -690,6 +690,13 @@ def books_by_id_api(req: func.HttpRequest) -> func.HttpResponse:
 
     Book identity:
       • book_id is a UUID (string) generated when the book is created.
+
+    NOTE: We also avoid conflicts with special routes:
+      /books/count
+      /books/purge
+      /books/validate
+    by forwarding those to their dedicated handlers.
+
     """
     logging.info("📗 [BooksByIdAPI] HTTP %s /books/{book_id}", req.method)
 
@@ -701,6 +708,20 @@ def books_by_id_api(req: func.HttpRequest) -> func.HttpResponse:
     if not book_id:
         logging.warning("⚠️ [BooksByIdAPI] Missing book_id route parameter.")
         return error_response("Missing book_id in route", status=400)
+     # 🔒 Reserved path names – forward them to the right function
+     
+    if book_id == "count" and req.method == "GET":
+        # Someone hit /api/books/count but routing chose this function.
+        logging.info("🔁 Forwarding /books/count to BooksCountAPI")
+        return books_count_api(req)
+
+    if book_id == "purge" and req.method == "POST":
+        logging.info("🔁 Forwarding /books/purge to BooksPurgeAPI")
+        return books_purge_api(req)
+
+    if book_id == "validate" and req.method == "PATCH":
+        logging.info("🔁 Forwarding /books/validate to BooksValidateAPI")
+        return books_validate_api(req)
 
     # ================================
     # GET /api/books/{book_id}
