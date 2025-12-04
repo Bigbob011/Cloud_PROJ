@@ -1,14 +1,15 @@
 # ---------------------------------------------------------
-# BooksAPI – Cloud Computing Midterm Project
+# BooksAPI – Cloud Computing Midterm + Final Project
 # Author: Braden Mackey
 # Course: CSE 300 - Cloud Computing
-# Date: October 2025
+# Date: October 2025 - December 2025
 #
 # Description:
 #   A RESTful Azure Function API for managing book records.
-#   Implements full CRUD functionality with in-memory storage,
-#   thread-safe operations, and simple API key authentication.
-#   Includes utility endpoints for counting and purging data.
+#   Supports full CRUD with either in-memory storage (local dev)
+#   or Azure SQL (production), controlled via configuration.
+#   Implements thread-safe operations and simple API key authentication,
+#   plus utility endpoints for counting, purging, and validating data.
 # ---------------------------------------------------------
 
 import os
@@ -28,9 +29,6 @@ try:
 except ImportError:
     pyodbc = None  # pyodbc is not available
 
-
-
-
 # =========================================================
 #  1. Application Initialization
 # =========================================================
@@ -47,6 +45,7 @@ books_lock = Lock()
 # -----------------------
 
 logger = logging.getLogger("booksapi")
+logger.setLevel(logging.INFO)
 
 # Local fallback key (used locally and as a fallback on Azure)
 LOCAL_API_KEY = os.getenv("API_KEY", "mysecretkey123")
@@ -61,6 +60,10 @@ REQUIRED_FIELDS = ["title", "author", "isbn", "publisher", "year", "description"
 
 # Cache for the API key so we don't call Key Vault on every request
 _cached_api_key: str | None = None
+
+# =========================================================
+#  SQL configuration (Azure SQL vs in-memory toggle)
+# =========================================================
 
 # When USE_SQL == "true" (string, case-insensitive), API will use Azure SQL
 USE_SQL = os.getenv("USE_SQL", "false").lower() == "true"
@@ -80,16 +83,6 @@ if USE_SQL and pyodbc is None:
         "Falling back to in-memory books store for this environment."
     )
     USE_SQL = False
-
-# =========================================================
-#  SQL configuration (Azure SQL vs in-memory toggle)
-# =========================================================
-
-# When USE_SQL == "true" (string, case-insensitive), API will use Azure SQL
-USE_SQL = os.getenv("USE_SQL", "false").lower() == "true"
-
-# Connection string for Azure SQL (managed identity / AAD)
-SQL_CONNECTION_STRING = os.getenv("SQL_CONNECTION_STRING")
 
 def row_to_book(row):
     """
@@ -400,9 +393,13 @@ def find_book_index(book_id: str) -> int:
 
 def get_sql_connection():
     """
-    Open a connection to Azure SQL.
-    - On Azure: uses Managed Identity (ActiveDirectoryMsi)
-    - Locally: we *do not* use SQL; local runs stay in-memory.
+    Open a connection to Azure SQL using Managed Identity.
+
+    - On Azure: uses the function app’s system-assigned identity
+      with ActiveDirectoryMsi authentication.
+
+    - Locally: we *do not* use SQL; local runs stay in-memory
+      (USE_SQL should be false in local.settings.json).
     """
     if not USE_SQL:
         raise RuntimeError("SQL is not enabled (USE_SQL is false)")
@@ -424,91 +421,6 @@ def get_sql_connection():
 
     # Short timeout so failures surface quickly
     return pyodbc.connect(conn_str, timeout=5)
-
-
-def db_insert_book(book: dict) -> dict:
-    """
-    Insert a book into the Azure SQL 'Books' table.
-
-    Expects a dict with keys:
-    title, author, isbn, publisher, year, description
-
-    Returns the same dict with an 'id' field (UUID string).
-    """
-    if not USE_SQL:
-        raise RuntimeError("db_insert_book called while USE_SQL is false")
-
-    # Generate ID in code to keep it simple
-    book_id = str(uuid.uuid4())
-
-    # Ensure 'year' is int (validate_book_schema should already have done this)
-    year_value = int(book["year"])
-
-    conn = get_sql_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO Books (Id, Title, Author, Isbn, Publisher, Year, Description)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    book_id,
-                    book["title"],
-                    book["author"],
-                    book["isbn"],
-                    book["publisher"],
-                    year_value,
-                    book["description"],
-                ),
-            )
-            conn.commit()
-    finally:
-        conn.close()
-
-    # Return a full book dict including the ID we assigned
-    result = dict(book)
-    result["id"] = book_id
-    return result
-
-def db_get_all_books() -> list[dict]:
-    """
-    Fetch all books from the Azure SQL 'Books' table
-    and return them as a list of dicts.
-    """
-    if not USE_SQL:
-        raise RuntimeError("db_get_all_books called while USE_SQL is false")
-
-    conn = get_sql_connection()
-    books_from_db: list[dict] = []
-
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT Id, Title, Author, Isbn, Publisher, Year, Description
-                FROM Books
-                """
-            )
-            rows = cur.fetchall()
-            for row in rows:
-                books_from_db.append(
-                    {
-                        "id": str(row.Id),
-                        "title": row.Title,
-                        "author": row.Author,
-                        "isbn": row.Isbn,
-                        "publisher": row.Publisher,
-                        "year": int(row.Year) if row.Year is not None else None,
-                        "description": row.Description,
-                    }
-                )
-    finally:
-        conn.close()
-
-    return books_from_db
-
-
 
 # =========================================================
 #  3. Main Collection Endpoints (/books)
@@ -708,10 +620,12 @@ def books_by_id_api(req: func.HttpRequest) -> func.HttpResponse:
     if not book_id:
         logging.warning("⚠️ [BooksByIdAPI] Missing book_id route parameter.")
         return error_response("Missing book_id in route", status=400)
-     # 🔒 Reserved path names – forward them to the right function
-     
+    
+    # Reserved path names – these routes are normally handled
+    # by their own functions, they are forwarded here just
+    # in case of any routing ambiguity.
+
     if book_id == "count" and req.method == "GET":
-        # Someone hit /api/books/count but routing chose this function.
         logging.info("🔁 Forwarding /books/count to BooksCountAPI")
         return books_count_api(req)
 
@@ -924,9 +838,4 @@ def books_validate_api(req: func.HttpRequest) -> func.HttpResponse:
     return json_response(payload, 200)
 
 
-
-
 # EOF ---------------------------------------------------------
-
-# class code start -- private readonly defaultazure credentail credential = new();
-# "az login" in terminal to log you in for local host. in not know what az is install azure CLI 
