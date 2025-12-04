@@ -46,6 +46,8 @@ books_lock = Lock()
 # Config / environment
 # -----------------------
 
+logger = logging.getLogger("booksapi")
+
 # Local fallback key (used locally and as a fallback on Azure)
 LOCAL_API_KEY = os.getenv("API_KEY", "mysecretkey123")
 
@@ -88,18 +90,6 @@ USE_SQL = os.getenv("USE_SQL", "false").lower() == "true"
 
 # Connection string for Azure SQL (managed identity / AAD)
 SQL_CONNECTION_STRING = os.getenv("SQL_CONNECTION_STRING")
-
-
-def get_sql_connection():
-    """
-    Create a new connection to Azure SQL using pyodbc.
-    Uses the connection string from SQL_CONNECTION_STRING.
-    """
-    if not SQL_CONNECTION_STRING:
-        raise RuntimeError("SQL_CONNECTION_STRING is not configured")
-    # autocommit=False so we can control commits explicitly
-    return pyodbc.connect(SQL_CONNECTION_STRING, autocommit=False)
-
 
 def row_to_book(row):
     """
@@ -238,7 +228,7 @@ def sql_get_book_count() -> int:
         cur.execute("SELECT COUNT(*) FROM dbo.Books")
         (count,) = cur.fetchone()
     return int(count)
-
+    
 
 def sql_validate_books() -> int:
     """
@@ -408,68 +398,11 @@ def find_book_index(book_id: str) -> int:
             return i
     return -1
 
-def db_insert_book(book: dict) -> dict:
-    """
-    Insert a new book into dbo.Books and return the book with its new ID.
-    Expects keys: title, author, isbn, publisher, year, description.
-    """
-    with get_sql_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO dbo.Books (Title, Author, Isbn, Publisher, Year, Description)
-                OUTPUT INSERTED.BookId
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                book["title"],
-                book["author"],
-                book["isbn"],
-                book["publisher"],
-                book["year"],
-                book["description"],
-            )
-            row = cur.fetchone()
-            conn.commit()
-
-    book["id"] = str(row[0])
-    return book
-
-
-def db_get_all_books() -> list[dict]:
-    """
-    gets all books from dbo.Books (the sql books table) and returns them as a list of dicts.
-    """
-    
-    with get_sql_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT BookId, Title, Author, Isbn, Publisher, Year, Description
-                FROM dbo.Books
-                ORDER BY CreatedAt DESC
-                """
-            )
-            rows = cur.fetchall()
-
-    result = []
-    for r in rows:
-        result.append(
-            {
-                "id": str(r[0]),
-                "title": r[1],
-                "author": r[2],
-                "isbn": r[3],
-                "publisher": r[4],
-                "year": int(r[5]) if r[5] is not None else None,
-                "description": r[6],
-            }
-        )
-    return result
-
 def get_sql_connection():
     """
-    Open a connection to Azure SQL using managed identity.
-    Only used when USE_SQL is True and running in Azure.
+    Open a connection to Azure SQL.
+    - On Azure: uses Managed Identity (ActiveDirectoryMsi)
+    - Locally: we *do not* use SQL; local runs stay in-memory.
     """
     if not USE_SQL:
         raise RuntimeError("SQL is not enabled (USE_SQL is false)")
@@ -489,7 +422,9 @@ def get_sql_connection():
         "TrustServerCertificate=no;"
     )
 
+    # Short timeout so failures surface quickly
     return pyodbc.connect(conn_str, timeout=5)
+
 
 def db_insert_book(book: dict) -> dict:
     """
@@ -797,30 +732,36 @@ def books_validate_api(req: func.HttpRequest) -> func.HttpResponse:
     PATCH /api/books/validate
 
     Runs a batch validation over all books.
-    SQL mode:
-      - Marks Archived = 1 for books older than 10 years.
-    In-memory mode:
-      - Sets an 'archived' flag on the local list.
 
-    Returns:
+    SQL mode (USE_SQL = True):
+      - Marks books as archived when they are older than 10 years.
+        (SET Archived = 1 WHERE year < currentYear - 10)
+
+    In-memory mode (USE_SQL = False, local dev only):
+      - Sets an 'archived' flag on items in the in-memory books list.
+
+    Response JSON:
       {
-        "updatedCount": <number>,
-        "timestamp": "2025-12-03T17:25:00Z",
-        "mode": "sql" or "memory"
+        "updatedCount": <int>,             # number of rows/items updated
+        "timestamp": "2025-12-03T17:25Z",  # UTC timestamp when validation completed
+        "mode": "sql" | "memory"           # which backing store was used
       }
     """
-    logging.info("📙 BooksValidateAPI invoked (PATCH /books/validate)")
+    logging.info("ValidationTriggered: PATCH /api/books/validate")
 
     # --- Authentication ---
     if not check_api_key(req):
+        logging.warning("ValidationUnauthorized: missing_or_invalid_api_key")
         return error_response("Unauthorized", 401)
 
-    # --- SQL-backed validation ---
+    # --- SQL-backed validation path ---
     if USE_SQL:
         try:
-            updated = sql_validate_books()
+            logging.info("ValidationMode: sql")
+            updated = sql_validate_books()  # helper that runs the SQL UPDATE and returns affected row count
         except Exception as ex:
-            logging.exception("Error validating books in SQL")
+            # Log full details to App Insights but return a safe error to the client
+            logging.exception("ValidationFailed: SQL validation error")
             return error_response(f"Database error during validation: {ex}", 500)
 
         payload = {
@@ -828,10 +769,16 @@ def books_validate_api(req: func.HttpRequest) -> func.HttpResponse:
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "mode": "sql",
         }
-        logging.info("✅ Books validation complete (SQL). Updated %d rows.", updated)
+        logging.info(
+            "ValidationCompletedSQL: updatedCount=%d timestamp=%s",
+            payload["updatedCount"],
+            payload["timestamp"],
+        )
         return json_response(payload, 200)
 
-    # --- In-memory fallback (local dev without SQL) ---
+    # --- In-memory fallback (local development without SQL) ---
+    logging.info("ValidationMode: memory (in-memory fallback)")
+
     current_year = datetime.utcnow().year
     cutoff_year = current_year - 10
     updated = 0
@@ -841,10 +788,13 @@ def books_validate_api(req: func.HttpRequest) -> func.HttpResponse:
             year = b.get("year")
             if year is None:
                 continue
+
             try:
                 y = int(year)
             except Exception:
+                # Skip items with non-numeric year
                 continue
+
             if y < cutoff_year and not b.get("archived"):
                 b["archived"] = True
                 updated += 1
@@ -854,8 +804,13 @@ def books_validate_api(req: func.HttpRequest) -> func.HttpResponse:
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "mode": "memory",
     }
-    logging.info("✅ Books validation complete (in-memory). Updated %d items.", updated)
+    logging.info(
+        "ValidationCompletedMemory: updatedCount=%d timestamp=%s",
+        payload["updatedCount"],
+        payload["timestamp"],
+    )
     return json_response(payload, 200)
+
 
 
 
