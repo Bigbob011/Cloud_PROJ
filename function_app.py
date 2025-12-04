@@ -61,6 +61,11 @@ _cached_api_key: str | None = None
 # Should this app use Azure SQL instead of in-memory list?
 USE_SQL = os.getenv("USE_SQL", "false").lower() == "true"
 
+# SQL connection configuration (used only if USE_SQL is true)
+SQL_SERVER = os.getenv("SQL_SERVER")  # e.g. "myserverss.database.windows.net"
+SQL_DATABASE = os.getenv("SQL_DATABASE")  # e.g. "MyDB"
+SQL_DRIVER = os.getenv("SQL_DRIVER", "{ODBC Driver 18 for SQL Server}")
+
 # If SQL is requested but pyodbc is missing, fall back to in-memory
 if USE_SQL and pyodbc is None:
     logging.warning(
@@ -197,47 +202,6 @@ def find_book_index(book_id: str) -> int:
             return i
     return -1
 
-def get_sql_connection():
-    """
-    Create a SQL connection using Managed Identity (no passwords).
-
-    - Uses DefaultAzureCredential, which in Azure Functions resolves to the
-      Function App's managed identity.
-    - Requests an access token for Azure SQL.
-    - Uses pyodbc with an access token instead of username/password.
-
-    Returns:
-        pyodbc.Connection
-
-    Raises:
-        RuntimeError / Exception if configuration is missing or the token/connection fails.
-    """
-    if not USE_SQL:
-        raise RuntimeError("USE_SQL is false – SQL connection not enabled in this environment.")
-
-    # Ask Azure for an access token to talk to Azure SQL
-    token = _sql_credential.get_token("https://database.windows.net/.default")
-
-    # Build the basic connection string (no user/password)
-    conn_str = (
-        f"Driver={SQL_DRIVER};"
-        f"Server=tcp:{SQL_SERVER},1433;"
-        f"Database={SQL_DATABASE};"
-        "Encrypt=yes;"
-        "TrustServerCertificate=no;"
-        "Connection Timeout=30;"
-    )
-
-    # Azure SQL expects the access token encoded as UTF-16-LE
-    token_bytes = token.token.encode("utf-16-le")
-
-    conn = pyodbc.connect(
-        conn_str,
-        attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_bytes}
-    )
-
-    return conn
-
 def db_insert_book(book: dict) -> dict:
     """
     Insert a new book into dbo.Books and return the book with its new ID.
@@ -267,8 +231,9 @@ def db_insert_book(book: dict) -> dict:
 
 def db_get_all_books() -> list[dict]:
     """
-    Read all books from dbo.Books and return them as a list of dicts.
+    gets all books from dbo.Books (the sql books table) and returns them as a list of dicts.
     """
+    
     with get_sql_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -295,6 +260,113 @@ def db_get_all_books() -> list[dict]:
         )
     return result
 
+def get_sql_connection():
+    """
+    Open a connection to Azure SQL using managed identity.
+    Only used when USE_SQL is True and running in Azure.
+    """
+    if not USE_SQL:
+        raise RuntimeError("SQL is not enabled (USE_SQL is false)")
+
+    if pyodbc is None:
+        raise RuntimeError("pyodbc is not available, cannot use SQL")
+
+    if not SQL_SERVER or not SQL_DATABASE:
+        raise RuntimeError("SQL_SERVER or SQL_DATABASE not configured")
+
+    conn_str = (
+        f"Driver={SQL_DRIVER};"
+        f"Server=tcp:{SQL_SERVER},1433;"
+        f"Database={SQL_DATABASE};"
+        "Authentication=ActiveDirectoryMsi;"
+        "Encrypt=yes;"
+        "TrustServerCertificate=no;"
+    )
+
+    return pyodbc.connect(conn_str, timeout=5)
+
+def db_insert_book(book: dict) -> dict:
+    """
+    Insert a book into the Azure SQL 'Books' table.
+
+    Expects a dict with keys:
+    title, author, isbn, publisher, year, description
+
+    Returns the same dict with an 'id' field (UUID string).
+    """
+    if not USE_SQL:
+        raise RuntimeError("db_insert_book called while USE_SQL is false")
+
+    # Generate ID in code to keep it simple
+    book_id = str(uuid.uuid4())
+
+    # Ensure 'year' is int (validate_book_schema should already have done this)
+    year_value = int(book["year"])
+
+    conn = get_sql_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO Books (Id, Title, Author, Isbn, Publisher, Year, Description)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    book_id,
+                    book["title"],
+                    book["author"],
+                    book["isbn"],
+                    book["publisher"],
+                    year_value,
+                    book["description"],
+                ),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+    # Return a full book dict including the ID we assigned
+    result = dict(book)
+    result["id"] = book_id
+    return result
+
+def db_get_all_books() -> list[dict]:
+    """
+    Fetch all books from the Azure SQL 'Books' table
+    and return them as a list of dicts.
+    """
+    if not USE_SQL:
+        raise RuntimeError("db_get_all_books called while USE_SQL is false")
+
+    conn = get_sql_connection()
+    books_from_db: list[dict] = []
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT Id, Title, Author, Isbn, Publisher, Year, Description
+                FROM Books
+                """
+            )
+            rows = cur.fetchall()
+            for row in rows:
+                books_from_db.append(
+                    {
+                        "id": str(row.Id),
+                        "title": row.Title,
+                        "author": row.Author,
+                        "isbn": row.Isbn,
+                        "publisher": row.Publisher,
+                        "year": int(row.Year) if row.Year is not None else None,
+                        "description": row.Description,
+                    }
+                )
+    finally:
+        conn.close()
+
+    return books_from_db
+
 
 
 # =========================================================
@@ -306,15 +378,15 @@ def db_get_all_books() -> list[dict]:
 def books_api(req: func.HttpRequest) -> func.HttpResponse:
     """
     Handle GET (list all books) and POST (add new book) requests.
-    This endpoint operates on the full collection.
+    Uses Azure SQL when USE_SQL=True, otherwise falls back to in-memory storage.
     """
-    logging.info("📘 BooksAPI invoked: %s", req.method)
+    logging.info("📘 BooksAPI invoked: %s (USE_SQL=%s)", req.method, USE_SQL)
 
     # --- Authentication ---
     if not check_api_key(req):
         return error_response("Unauthorized", 401)
 
-    # --- POST: Create a new book record ---
+    # --- POST: Create a new book ---
     if req.method == "POST":
         if not require_json_content(req):
             return error_response("Content-Type must be application/json", 400)
@@ -323,24 +395,43 @@ def books_api(req: func.HttpRequest) -> func.HttpResponse:
         except ValueError:
             return error_response("Invalid JSON body", 400)
 
-        valid, err = validate_book_schema(body, True)
+        valid, err = validate_book_schema(body, require_all=True)
         if not valid:
             return error_response(err, 400)
 
-        # Assign a unique ID and append safely
+        # If SQL is enabled, write to Azure SQL
+        if USE_SQL:
+            try:
+                stored_book = db_insert_book(body)
+                return json_response(stored_book, 201)
+            except Exception as ex:
+                logging.exception("Failed to insert book into SQL")
+                return error_response(f"Database error: {ex}", 500)
+
+        # Otherwise: fallback to in-memory list (local dev / demo)
         book = dict(body)
         book["id"] = str(uuid.uuid4())
         with books_lock:
             books.append(book)
-
         return json_response(book, 201)
 
     # --- GET: Retrieve all stored books ---
     elif req.method == "GET":
+        # When SQL is enabled, fetch from DB
+        if USE_SQL:
+            try:
+                all_books = db_get_all_books()
+                return json_response(all_books, 200)
+            except Exception as ex:
+                logging.exception("Failed to fetch books from SQL")
+                return error_response(f"Database error: {ex}", 500)
+
+        # Otherwise: return in-memory books
         with books_lock:
             copy = list(books)
         return json_response(copy, 200)
 
+    # Any other verb on /books is not allowed
     return error_response("Method not allowed", 405)
 
 
