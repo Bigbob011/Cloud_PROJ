@@ -1,5 +1,33 @@
-# Cloud_PROJ
-my cloud final project 
+📚 BooksAPI – Azure Cloud Project
+
+README
+
+This project implements a fully serverless, secure, scalable Books REST API using:
+
+Azure Functions (Python) – HTTP-triggered endpoints
+
+Azure SQL Database – persistent storage
+
+Azure Key Vault – secure API key storage
+
+Managed Identity – secure auth between Function App ↔ SQL ↔ Key Vault
+
+Application Insights – observability, metrics, dashboards, KQL
+
+Logic App Automation – scheduled archival validation
+
+The API supports CRUD operations, count, purge, and batch validation of books.
+
+📁 Project Structure
+function_app.py         # Main Azure Function App (all endpoints)
+local.settings.json     # Local environment config (not used in Azure)
+requirements.txt        # Python package dependencies
+README.md               # Documentation (this file)
+
+⚙️ Environment Variables
+
+The Function App uses the following configuration settings.
+Local values come from local.settings.json; Azure uses Application Settings.
 
 | Setting name               | Example value                               | Purpose                                                                                          |
 | -------------------------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------ |
@@ -15,15 +43,17 @@ my cloud final project
 | `SQL_CONNECTION_STRING`    | *(optional)*                                | Left from an earlier version; current code uses `SQL_SERVER` + `SQL_DATABASE` + Managed Identity |
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-In Azure, USE_KEYVAULT=true and KEYVAULT_URL are set.
-get_api_key() uses DefaultAzureCredential + SecretClient to read API_KEY_SECRET_NAME once, caches it, and compares it to the x-api-key header.
+🔐 Authentication Flow
 
-Locally, USE_KEYVAULT=false and the key is read from API_KEY in local.settings.json.
+Azure (production):
+USE_KEYVAULT=true → API key retrieved with DefaultAzureCredential + Key Vault → cached
+SQL authentication uses Managed Identity—no passwords.
 
-=========================books================================
+Local development:
+USE_KEYVAULT=false → API key read from API_KEY in local settings.
 
-A Book in the API has the following JSON shape:
-
+📘 Book Data Model
+JSON Shape Returned by API
 {
   "id": "a0a1f922-4b1f-4c80-9a2f-55d3ebf045d1",
   "title": "Example Book",
@@ -31,39 +61,40 @@ A Book in the API has the following JSON shape:
   "isbn": "978-1234567890",
   "publisher": "Example Press",
   "year": 2020,
-  "description": "A sample book used for testing.",
+  "description": "A sample book.",
   "archived": false
 }
 
+SQL Schema (dbo.Books)
+Column	Type
+Id	uniqueidentifier (PK)
+Title	nvarchar(255)
+Author	nvarchar(255)
+Isbn	nvarchar(64)
+Publisher	nvarchar(255)
+Year	int
+Description	nvarchar(max)
+Archived	bit
 
-In SQL, this maps to dbo.Books columns:
-Id (uniqueidentifier), Title, Author, Isbn, Publisher, [Year], [Description], Archived (bit).
 
---------------------------------------------------------------------------------
-====================================ENDPOINTS=====================================
----------------------------------------------------------------------------------
+🚀 API Endpoints
 
-All endpoints are rooted at:
+All endpoints require:
 
-Local: http://localhost:7071/api/...
+x-api-key: <your key here>
 
-Azure: https://<your-func-app-name>.azurewebsites.net/api/...
+Base URLs:
+Local: http://localhost:7071/api/
+Azure: https://theapp1-hhaka7cne0a0g5ed.eastus2-01.azurewebsites.net/api/
 
-All requests must send: x-api-key: <your key>.
+1️⃣ GET /api/books
 
-1. GET /api/books
+Returns all books.
 
-Description:
-Return all books.
-
-SQL mode: reads from dbo.Books.
-Memory mode: reads from the in-memory list.
-
-Response 200:
-
+✔ 200 OK
 [
   {
-    "id": "a0a1f922-4b1f-4c80-9a2f-55d3ebf045d1",
+    "id": "UUID",
     "title": "Example Book",
     "author": "Jane Doe",
     "isbn": "978-1234567890",
@@ -74,21 +105,16 @@ Response 200:
   }
 ]
 
+2️⃣ POST /api/books
 
-
-2. POST /api/books
-
-Description:
-Create a new book.
+Creates a new book.
 
 Headers:
 
 Content-Type: application/json
-
 x-api-key: ...
 
-Request body:
-
+Request Example
 {
   "title": "New Book",
   "author": "John Smith",
@@ -98,111 +124,53 @@ Request body:
   "description": "Created via Thunder Client"
 }
 
+✔ 201 Created
 
-Response 201 Created:
+Returns the created book with generated UUID.
 
-{
-  "id": "generated-uuid-here",
-  "title": "New Book",
-  "author": "John Smith",
-  "isbn": "978-1111111111",
-  "publisher": "My Publisher",
-  "year": 2024,
-  "description": "Created via Thunder Client",
-  "archived": false
-}
+3️⃣ GET /api/books/{book_id}
 
+Returns a single book by ID.
 
-Validation errors return 400 with:
+❌ 404 Not Found
+{ "error": "Book not found" }
 
-{ "error": "Missing required field: title" }
+4️⃣ PUT /api/books/{book_id}
 
+Partial update of any field except id.
 
+❌ Changing the ID is rejected:
+{ "error": "Cannot change book id" }
 
-3. GET /api/books/{book_id}
+5️⃣ DELETE /api/books/{book_id}
 
-Description:
-Retrieve a single book by ID.
+Deletes the book.
 
-Returns 404 with { "error": "Book not found" } if the ID does not exist.
+✔ 200 OK
+{ "message": "Deleted successfully" }
 
+6️⃣ GET /api/books/count
 
+Returns number of books.
 
-4. PUT /api/books/{book_id}
-
-Description:
-Update an existing book (partial update). Any subset of fields is allowed.
-
-Example request:
-
-{
-  "title": "Updated Title",
-  "year": 2021
-}
-
-
-Attempts to change "id" are rejected with 400 and {"error": "Cannot change book id"}.
-
-
-
-5. DELETE /api/books/{book_id}
-
-Description:
-Delete a book.
-
-200 with {"message": "Deleted successfully"} when it exists.
-
-404 with {"error": "Book not found"} otherwise.
-
-
-
-6. GET /api/books/count
-
-Description:
-Return the number of books.
-
-Response 200:
-
+✔ Example Response
 { "count": 42 }
 
+7️⃣ POST /api/books/purge
 
-Backed by sql_get_book_count() when USE_SQL=True, otherwise len(books).
+Deletes all books.
 
-
-
-7. POST /api/books/purge
-
-Description:
-Delete all books.
-
-SQL mode: DELETE FROM dbo.Books.
-
-Memory mode: books.clear().
-
-Response 200:
-
+✔ Example Response
 { "message": "All books removed (deleted 10)" }
 
+8️⃣ PATCH /api/books/validate
 
-Where 10 is the number of rows/items removed.
+Batch validation + archival.
 
+Rule:
+Books older than 10 years (Year < currentYear - 10) become archived = true.
 
-
-8. PATCH /api/books/validate
-
-Description:
-Batch validation / archival.
-
-Rules:
-
-SQL mode:
-Archived = 1 for any book where Year < (currentYear - 10) and not already archived.
-
-Memory mode:
-Sets b["archived"] = True for those items.
-
-Response 200:
-
+✔ Example Response
 {
   "updatedCount": 3,
   "timestamp": "2025-12-04T07:30:12.345678Z",
@@ -210,5 +178,98 @@ Response 200:
 }
 
 
-Or "mode": "memory" in local testing.
+📊 Monitoring & Observability (KQL)
+
+The following logs tables are used:
+
+AppRequests
+
+AppMetrics
+
+AppPerformanceCounters
+
+AppTraces
+
+Example Query (Validate Endpoint Metrics)
+AppRequests
+| where Name has "/api/books/validate"
+| summarize 
+    calls=count(),
+    failures=countif(Success == false),
+    avgDurationMs=avg(DurationMs)
+    by bin(TimeGenerated, 1h)
+| render timechart
+
+
+These queries power the dashboard tiles:
+
+Total API Hits
+
+Server Requests
+
+Validation Job Success Count
+
+API Latency
+
+SQL Diagnostics
+
+
+🔄 Automation (Logic App)
+
+A daily Logic App calls:
+
+PATCH /api/books/validate
+
+
+This ensures books older than 10 years are automatically archived.
+
+
+🔐 Security Summary
+
+API key stored in Key Vault
+
+Function App authenticates via Managed Identity
+
+SQL Database firewall locked down
+
+No secrets stored in code
+
+All endpoints require x-api-key
+
+
+🧪 Local Development
+
+Install Azure Functions Core Tools
+
+Create virtual environment
+
+Install requirements:
+
+pip install -r requirements.txt
+
+
+Run:
+
+func start
+
+
+Use Thunder Client / Postman with header:
+
+x-api-key: <local API_KEY>
+
+
+📦 Deployment
+
+Use:
+
+func azure functionapp publish theapp1-hhaka7cne0a0g5ed
+
+
+Ensure:
+
+You are logged in (az login)
+
+Your Function App exists
+
+Environment variables are set in Azure
 
