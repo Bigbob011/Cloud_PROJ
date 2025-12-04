@@ -19,6 +19,8 @@ from threading import Lock
 import azure.functions as func
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.secrets import SecretClient
+from datetime import datetime 
+
 
 # so pyodbc dosent crash local testing because it exists in azure but not locally
 try: 
@@ -58,13 +60,16 @@ REQUIRED_FIELDS = ["title", "author", "isbn", "publisher", "year", "description"
 # Cache for the API key so we don't call Key Vault on every request
 _cached_api_key: str | None = None
 
-# Should this app use Azure SQL instead of in-memory list?
+# When USE_SQL == "true" (string, case-insensitive), API will use Azure SQL
 USE_SQL = os.getenv("USE_SQL", "false").lower() == "true"
 
 # SQL connection configuration (used only if USE_SQL is true)
 SQL_SERVER = os.getenv("SQL_SERVER")  # e.g. "myserverss.database.windows.net"
 SQL_DATABASE = os.getenv("SQL_DATABASE")  # e.g. "MyDB"
 SQL_DRIVER = os.getenv("SQL_DRIVER", "{ODBC Driver 18 for SQL Server}")
+
+# Connection string for Azure SQL (managed identity / AAD)
+SQL_CONNECTION_STRING = os.getenv("SQL_CONNECTION_STRING")
 
 # If SQL is requested but pyodbc is missing, fall back to in-memory
 if USE_SQL and pyodbc is None:
@@ -74,6 +79,207 @@ if USE_SQL and pyodbc is None:
     )
     USE_SQL = False
 
+# =========================================================
+#  SQL configuration (Azure SQL vs in-memory toggle)
+# =========================================================
+
+# When USE_SQL == "true" (string, case-insensitive), API will use Azure SQL
+USE_SQL = os.getenv("USE_SQL", "false").lower() == "true"
+
+# Connection string for Azure SQL (managed identity / AAD)
+SQL_CONNECTION_STRING = os.getenv("SQL_CONNECTION_STRING")
+
+
+def get_sql_connection():
+    """
+    Create a new connection to Azure SQL using pyodbc.
+    Uses the connection string from SQL_CONNECTION_STRING.
+    """
+    if not SQL_CONNECTION_STRING:
+        raise RuntimeError("SQL_CONNECTION_STRING is not configured")
+    # autocommit=False so we can control commits explicitly
+    return pyodbc.connect(SQL_CONNECTION_STRING, autocommit=False)
+
+
+def row_to_book(row):
+    """
+    Convert a SQL row from dbo.Books into the JSON shape used by the API.
+    Assumes SELECT order:
+      Id, Title, Author, Isbn, Publisher, [Year], [Description], Archived
+    """
+    # Access by index so we don't care about column name casing
+    return {
+        "id": str(row[0]),
+        "title": row[1],
+        "author": row[2],
+        "isbn": row[3],
+        "publisher": row[4],
+        "year": int(row[5]) if row[5] is not None else None,
+        "description": row[6],
+        "archived": bool(row[7]) if len(row) > 7 else False,
+    }
+
+# =========================================================
+#  SQL helper functions for Books
+# =========================================================
+
+
+def sql_insert_book(book_data: dict) -> dict:
+    """
+    Insert a book into dbo.Books and return the full book (with generated ID).
+    """
+    new_id = str(uuid.uuid4())
+
+    with get_sql_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO dbo.Books (Id, Title, Author, Isbn, Publisher, [Year], [Description], Archived)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            new_id,
+            book_data["title"],
+            book_data["author"],
+            book_data["isbn"],
+            book_data["publisher"],
+            book_data["year"],
+            book_data["description"],
+        )
+        conn.commit()
+
+    result = dict(book_data)
+    result["id"] = new_id
+    result["archived"] = False
+    return result
+
+
+def sql_get_all_books() -> list:
+    with get_sql_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT Id, Title, Author, Isbn, Publisher, [Year], [Description], Archived
+            FROM dbo.Books
+            ORDER BY Title
+            """
+        )
+        rows = cur.fetchall()
+    return [row_to_book(r) for r in rows]
+
+
+def sql_get_book_by_id(book_id: str):
+    with get_sql_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT Id, Title, Author, Isbn, Publisher, [Year], [Description], Archived
+            FROM dbo.Books
+            WHERE Id = ?
+            """,
+            book_id,
+        )
+        row = cur.fetchone()
+    return row_to_book(row) if row else None
+
+
+def sql_update_book(book_id: str, patch: dict):
+    """
+    Apply a partial update to a book row.
+    Only updates fields present in `patch`.
+    """
+    # Map JSON field names to SQL column names
+    field_map = {
+        "title": "Title",
+        "author": "Author",
+        "isbn": "Isbn",
+        "publisher": "Publisher",
+        "year": "Year",
+        "description": "Description",
+    }
+
+    set_clauses = []
+    params = []
+
+    for json_field, column in field_map.items():
+        if json_field in patch:
+            set_clauses.append(f"{column} = ?")
+            params.append(patch[json_field])
+
+    if not set_clauses:
+        # Nothing to update
+        return sql_get_book_by_id(book_id)
+
+    params.append(book_id)
+    sql = "UPDATE dbo.Books SET " + ", ".join(set_clauses) + " WHERE Id = ?"
+
+    with get_sql_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        conn.commit()
+
+    return sql_get_book_by_id(book_id)
+
+
+def sql_delete_book(book_id: str) -> int:
+    """
+    Delete a book. Returns number of rows affected (0 or 1).
+    """
+    with get_sql_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM dbo.Books WHERE Id = ?", book_id)
+        affected = cur.rowcount
+        conn.commit()
+    return affected
+
+
+def sql_get_book_count() -> int:
+    with get_sql_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM dbo.Books")
+        (count,) = cur.fetchone()
+    return int(count)
+
+
+def sql_validate_books() -> int:
+    """
+    Validation rule for books:
+      - If Year < (currentYear - 10), mark Archived = 1.
+
+    Returns the number of rows updated.
+    """
+    from datetime import datetime
+
+    current_year = datetime.utcnow().year
+    cutoff_year = current_year - 10
+
+    with get_sql_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE dbo.Books
+            SET Archived = 1
+            WHERE [Year] IS NOT NULL
+              AND [Year] < ?
+              AND (Archived = 0 OR Archived IS NULL)
+            """,
+            cutoff_year,
+        )
+        affected = cur.rowcount
+        conn.commit()
+
+    return int(affected)
+
+
+def sql_purge_books() -> int:
+    """
+    Delete all books. Returns number of rows deleted.
+    """
+    with get_sql_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM dbo.Books")
+        affected = cur.rowcount
+        conn.commit()
+    return affected
 
 
 # =========================================================
@@ -377,16 +583,19 @@ def db_get_all_books() -> list[dict]:
 @app.route(route="books", methods=["GET", "POST"])
 def books_api(req: func.HttpRequest) -> func.HttpResponse:
     """
-    Handle GET (list all books) and POST (add new book) requests.
-    Uses Azure SQL when USE_SQL=True, otherwise falls back to in-memory storage.
+    Handle:
+      - GET /api/books   -> list all books
+      - POST /api/books  -> create a new book
+
+    Uses Azure SQL when USE_SQL is true, otherwise falls back to in-memory list.
     """
-    logging.info("📘 BooksAPI invoked: %s (USE_SQL=%s)", req.method, USE_SQL)
+    logging.info("📘 BooksAPI invoked: %s", req.method)
 
     # --- Authentication ---
     if not check_api_key(req):
         return error_response("Unauthorized", 401)
 
-    # --- POST: Create a new book ---
+    # ---------- POST: create ----------
     if req.method == "POST":
         if not require_json_content(req):
             return error_response("Content-Type must be application/json", 400)
@@ -399,41 +608,38 @@ def books_api(req: func.HttpRequest) -> func.HttpResponse:
         if not valid:
             return error_response(err, 400)
 
-        # If SQL is enabled, write to Azure SQL
+        # SQL path
         if USE_SQL:
             try:
-                stored_book = db_insert_book(body)
-                return json_response(stored_book, 201)
+                new_book = sql_insert_book(body)
+                return json_response(new_book, 201)
             except Exception as ex:
-                logging.exception("Failed to insert book into SQL")
+                logging.exception("Error inserting book into SQL")
                 return error_response(f"Database error: {ex}", 500)
 
-        # Otherwise: fallback to in-memory list (local dev / demo)
+        # In-memory fallback (local dev without SQL)
         book = dict(body)
         book["id"] = str(uuid.uuid4())
         with books_lock:
             books.append(book)
         return json_response(book, 201)
 
-    # --- GET: Retrieve all stored books ---
-    elif req.method == "GET":
-        # When SQL is enabled, fetch from DB
+    # ---------- GET: list all ----------
+    if req.method == "GET":
         if USE_SQL:
             try:
-                all_books = db_get_all_books()
+                all_books = sql_get_all_books()
                 return json_response(all_books, 200)
             except Exception as ex:
-                logging.exception("Failed to fetch books from SQL")
+                logging.exception("Error querying books from SQL")
                 return error_response(f"Database error: {ex}", 500)
 
-        # Otherwise: return in-memory books
+        # In-memory fallback
         with books_lock:
             copy = list(books)
         return json_response(copy, 200)
 
-    # Any other verb on /books is not allowed
     return error_response("Method not allowed", 405)
-
 
 # =========================================================
 #  4. Utility Endpoints (/books/count, /books/purge)
@@ -442,23 +648,41 @@ def books_api(req: func.HttpRequest) -> func.HttpResponse:
 @app.function_name(name="BooksCountAPI")
 @app.route(route="books/count", methods=["GET"])
 def books_count_api(req: func.HttpRequest) -> func.HttpResponse:
-    """Return the total number of books in memory."""
     if not check_api_key(req):
         return error_response("Unauthorized", 401)
+
+    if USE_SQL:
+        try:
+            n = sql_get_book_count()
+        except Exception as ex:
+            logging.exception("Error counting books in SQL")
+            return error_response(f"Database error: {ex}", 500)
+        return json_response({"count": n}, 200)
+
     with books_lock:
         n = len(books)
     return json_response({"count": n}, 200)
 
 
+
 @app.function_name(name="BooksPurgeAPI")
 @app.route(route="books/purge", methods=["POST"])
 def books_purge_api(req: func.HttpRequest) -> func.HttpResponse:
-    """Clear all books from memory (for testing or resets)."""
     if not check_api_key(req):
         return error_response("Unauthorized", 401)
+
+    if USE_SQL:
+        try:
+            deleted = sql_purge_books()
+        except Exception as ex:
+            logging.exception("Error purging books in SQL")
+            return error_response(f"Database error: {ex}", 500)
+        return json_response({"message": f"All books removed (deleted {deleted})"}, 200)
+
     with books_lock:
         books.clear()
     return json_response({"message": "All books removed"}, 200)
+
 
 
 # =========================================================
@@ -469,35 +693,39 @@ def books_purge_api(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="books/{book_id}", methods=["GET", "PUT", "DELETE"])
 def books_by_id_api(req: func.HttpRequest) -> func.HttpResponse:
     """
-    Handle GET, PUT, and DELETE requests for a specific book.
+    Handle GET, PUT, DELETE for a specific book.
     Book is identified by its unique UUID in the route.
     """
     logging.info("📗 BooksByIdAPI invoked: %s", req.method)
 
-    # --- Authentication ---
     if not check_api_key(req):
         return error_response("Unauthorized", 401)
 
-    # --- Route parameter ---
     book_id = req.route_params.get("book_id")
     if not book_id:
         return error_response("Missing book_id in route", 400)
 
-    # --- Fix for overlapping routes (count, purge) ---
-    if book_id == "count" and req.method == "GET":
-        return books_count_api(req)
-    if book_id == "purge" and req.method == "POST":
-        return books_purge_api(req)
-
-    # --- GET: Retrieve a specific book ---
+    # ---------- GET by ID ----------
     if req.method == "GET":
+        if USE_SQL:
+            try:
+                book = sql_get_book_by_id(book_id)
+            except Exception as ex:
+                logging.exception("Error reading book from SQL")
+                return error_response(f"Database error: {ex}", 500)
+
+            if not book:
+                return error_response("Book not found", 404)
+            return json_response(book, 200)
+
+        # In-memory fallback
         with books_lock:
             for b in books:
                 if b.get("id") == book_id:
                     return json_response(b, 200)
         return error_response("Book not found", 404)
 
-    # --- PUT: Update an existing book ---
+    # ---------- PUT (partial update) ----------
     if req.method == "PUT":
         if not require_json_content(req):
             return error_response("Content-Type must be application/json", 400)
@@ -506,15 +734,28 @@ def books_by_id_api(req: func.HttpRequest) -> func.HttpResponse:
         except ValueError:
             return error_response("Invalid JSON body", 400)
 
-        valid, err = validate_book_schema(body, False)
+        valid, err = validate_book_schema(body, require_all=False)
         if not valid:
             return error_response(err, 400)
 
+        if USE_SQL:
+            try:
+                updated = sql_update_book(book_id, body)
+            except Exception as ex:
+                logging.exception("Error updating book in SQL")
+                return error_response(f"Database error: {ex}", 500)
+
+            if not updated:
+                return error_response("Book not found", 404)
+            return json_response(updated, 200)
+
+        # In-memory fallback
         with books_lock:
             idx = find_book_index(book_id)
             if idx == -1:
                 return error_response("Book not found", 404)
 
+            # Prevent ID changes
             if "id" in body and body["id"] != book_id:
                 return error_response("Cannot change book id", 400)
 
@@ -522,8 +763,20 @@ def books_by_id_api(req: func.HttpRequest) -> func.HttpResponse:
             updated = books[idx].copy()
         return json_response(updated, 200)
 
-    # --- DELETE: Remove a book by ID ---
+    # ---------- DELETE ----------
     if req.method == "DELETE":
+        if USE_SQL:
+            try:
+                affected = sql_delete_book(book_id)
+            except Exception as ex:
+                logging.exception("Error deleting book in SQL")
+                return error_response(f"Database error: {ex}", 500)
+
+            if affected == 0:
+                return error_response("Book not found", 404)
+            return json_response({"message": "Deleted successfully"}, 200)
+
+        # In-memory fallback
         with books_lock:
             idx = find_book_index(book_id)
             if idx == -1:
@@ -532,6 +785,78 @@ def books_by_id_api(req: func.HttpRequest) -> func.HttpResponse:
         return json_response({"message": "Deleted successfully"}, 200)
 
     return error_response("Method not allowed", 405)
+
+# =========================================================
+#  6. Validation Endpoint (/books/validate)
+# =========================================================
+
+@app.function_name(name="BooksValidateAPI")
+@app.route(route="books/validate", methods=["PATCH"])
+def books_validate_api(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    PATCH /api/books/validate
+
+    Runs a batch validation over all books.
+    SQL mode:
+      - Marks Archived = 1 for books older than 10 years.
+    In-memory mode:
+      - Sets an 'archived' flag on the local list.
+
+    Returns:
+      {
+        "updatedCount": <number>,
+        "timestamp": "2025-12-03T17:25:00Z",
+        "mode": "sql" or "memory"
+      }
+    """
+    logging.info("📙 BooksValidateAPI invoked (PATCH /books/validate)")
+
+    # --- Authentication ---
+    if not check_api_key(req):
+        return error_response("Unauthorized", 401)
+
+    # --- SQL-backed validation ---
+    if USE_SQL:
+        try:
+            updated = sql_validate_books()
+        except Exception as ex:
+            logging.exception("Error validating books in SQL")
+            return error_response(f"Database error during validation: {ex}", 500)
+
+        payload = {
+            "updatedCount": updated,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "mode": "sql",
+        }
+        logging.info("✅ Books validation complete (SQL). Updated %d rows.", updated)
+        return json_response(payload, 200)
+
+    # --- In-memory fallback (local dev without SQL) ---
+    current_year = datetime.utcnow().year
+    cutoff_year = current_year - 10
+    updated = 0
+
+    with books_lock:
+        for b in books:
+            year = b.get("year")
+            if year is None:
+                continue
+            try:
+                y = int(year)
+            except Exception:
+                continue
+            if y < cutoff_year and not b.get("archived"):
+                b["archived"] = True
+                updated += 1
+
+    payload = {
+        "updatedCount": updated,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "mode": "memory",
+    }
+    logging.info("✅ Books validation complete (in-memory). Updated %d items.", updated)
+    return json_response(payload, 200)
+
 
 
 # EOF ---------------------------------------------------------
